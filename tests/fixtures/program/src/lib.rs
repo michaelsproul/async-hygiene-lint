@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_variables)]
+#![allow(dead_code, unused_variables, unknown_lints)]
 
 fn bad() { std::hint::black_box(()); }
 fn other_bad() { std::hint::black_box(()); }
@@ -35,3 +35,25 @@ pub async fn trait_call() { generic_work(&Worker); } //~ prohibited
 pub struct BlockingDrop;
 impl Drop for BlockingDrop { fn drop(&mut self) { bad(); } }
 pub async fn destructor() { let _guard = BlockingDrop; } //~ prohibited
+
+fn good() {}
+fn identity(f: fn()) -> fn() { f }
+pub async fn separate_arguments() { let _unused = identity(bad); identity(good)(); }
+pub async fn separate_fields() { let pair: (fn(), fn()) = (bad, good); pair.1(); }
+pub async fn field_called() { let pair: (fn(), fn()) = (bad, good); pair.0(); } //~ prohibited
+pub async fn captured_pointer() { let f: fn() = bad; let closure = move || f(); closure(); } //~ prohibited
+pub async fn closure_pointer() { let f: fn() = || bad(); f(); } //~ prohibited
+pub fn future_capture() { let f: fn() = bad; let _future = async move { f(); }; } //~ prohibited
+pub fn future_capture_safe() { let pair: (fn(), fn()) = (bad, good); let _future = async move { pair.1(); }; }
+
+pub struct CustomFuture;
+impl std::future::Future for CustomFuture {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> { bad(); std::task::Poll::Ready(()) } //~ prohibited
+}
+
+#[allow(disallowed_from_async)]
+pub async fn explicitly_allowed() { bad(); }
+
+pub async fn unknown_pointer(f: fn()) { f(); } //~ incomplete
+pub async fn dynamic_dispatch(x: &dyn Work) { x.work(); } //~ incomplete

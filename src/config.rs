@@ -37,25 +37,33 @@ impl Default for Config {
                     reason: "blocks the executor thread".into(),
                 },
                 Prohibited {
-                    path: "tokio::runtime::*::block_on".into(),
+                    path: "tokio::runtime::Runtime::block_on".into(),
                     reason: "cannot start a runtime from within a runtime".into(),
                 },
                 Prohibited {
-                    path: "futures_executor::*block_on".into(),
+                    path: "tokio::runtime::Handle::block_on".into(),
+                    reason: "cannot start a runtime from within a runtime".into(),
+                },
+                Prohibited {
+                    path: "futures_executor::block_on".into(),
                     reason: "blocks the executor thread".into(),
                 },
             ],
             insulators: vec![
                 Insulator {
-                    path: "tokio::task::blocking::spawn_blocking".into(),
+                    path: "tokio::task::spawn_blocking".into(),
                     callback_args: vec![0],
                 },
                 Insulator {
-                    path: "tokio::runtime::*::spawn_blocking".into(),
+                    path: "tokio::runtime::Handle::spawn_blocking".into(),
                     callback_args: vec![1],
                 },
                 Insulator {
-                    path: "tokio::task::blocking::block_in_place".into(),
+                    path: "tokio::runtime::Runtime::spawn_blocking".into(),
+                    callback_args: vec![1],
+                },
+                Insulator {
+                    path: "tokio::task::block_in_place".into(),
                     callback_args: vec![0],
                 },
                 Insulator {

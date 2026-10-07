@@ -3,34 +3,115 @@ use crate::{
     config::{self, Config},
 };
 use rustc_errors::DiagDecorator;
-use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::{
+    def::DefKind,
+    def_id::{DefId, LocalDefId},
+};
 use rustc_lint::LateContext;
 use rustc_middle::{
-    mir::{Body, Operand, Rvalue, StatementKind, TerminatorKind},
+    mir::{
+        AggregateKind, Body, Operand, Place, PlaceElem, ProjectionElem, Rvalue, StatementKind,
+        TerminatorKind,
+    },
     ty::{self, EarlyBinder, Instance, InstanceKind, Ty, TyCtxt, TypeVisitableExt, TypingEnv},
 };
 use rustc_span::Span;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-/// May-target sets for function pointers. References and aggregate fields are
-/// conservatively merged; merely storing a callable does not create a call edge.
-#[derive(Clone, Default, PartialEq, Eq)]
-struct Value<'tcx>(Vec<Instance<'tcx>>);
+/// Callable provenance is field-sensitive. References retain the pointee's
+/// abstract value; array indices conservatively join all possible elements.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+struct Value<'tcx> {
+    targets: Vec<Instance<'tcx>>,
+    fields: BTreeMap<usize, Value<'tcx>>,
+    truncated: bool,
+}
 
 impl<'tcx> Value<'tcx> {
+    fn function(target: Instance<'tcx>) -> Self {
+        Self {
+            targets: vec![target],
+            ..Self::default()
+        }
+    }
+
+    fn is_truncated(&self) -> bool {
+        self.truncated || self.fields.values().any(Self::is_truncated)
+    }
+
     fn join(&mut self, other: &Self) -> bool {
+        self.join_at_depth(other, 0)
+    }
+
+    fn join_at_depth(&mut self, other: &Self, depth: usize) -> bool {
         let mut changed = false;
-        for target in &other.0 {
-            if !self.0.contains(target) {
-                self.0.push(*target);
+        for target in &other.targets {
+            if !self.targets.contains(target) {
+                self.targets.push(*target);
                 changed = true;
+            }
+        }
+        let truncated = other.truncated || (depth >= 8 && !other.fields.is_empty());
+        if truncated && !self.truncated {
+            self.truncated = true;
+            changed = true;
+        }
+        if depth < 8 {
+            for (field, value) in &other.fields {
+                changed |= self
+                    .fields
+                    .entry(*field)
+                    .or_default()
+                    .join_at_depth(value, depth + 1);
             }
         }
         changed
     }
+
+    fn projected(&self, projection: &[PlaceElem<'tcx>]) -> Self {
+        let Some((first, rest)) = projection.split_first() else {
+            return self.clone();
+        };
+        match first {
+            ProjectionElem::Field(field, _) => self
+                .fields
+                .get(&field.as_usize())
+                .map_or_else(Self::default, |value| value.projected(rest)),
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                let mut value = Self::default();
+                for field in self.fields.values() {
+                    value.join(&field.projected(rest));
+                }
+                value
+            }
+            _ => self.projected(rest),
+        }
+    }
+
+    fn assign(&mut self, projection: &[PlaceElem<'tcx>], value: &Self) -> bool {
+        let Some((first, rest)) = projection.split_first() else {
+            return self.join(value);
+        };
+        match first {
+            ProjectionElem::Field(field, _) => self
+                .fields
+                .entry(field.as_usize())
+                .or_default()
+                .assign(rest, value),
+            // Array indices are represented by one joined element for writes.
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                self.fields.entry(0).or_default().assign(rest, value)
+            }
+            _ => self.assign(rest, value),
+        }
+    }
 }
 
-#[derive(Clone)]
+fn place_value<'tcx>(locals: &[Value<'tcx>], place: &Place<'tcx>) -> Value<'tcx> {
+    locals[place.local.as_usize()].projected(place.projection)
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct Edge {
     target: usize,
     span: Span,
@@ -38,6 +119,7 @@ struct Edge {
 
 struct Node<'tcx> {
     instance: Instance<'tcx>,
+    env: TypingEnv<'tcx>,
     inputs: Vec<Value<'tcx>>,
     output: Value<'tcx>,
     edges: Vec<Edge>,
@@ -48,9 +130,11 @@ struct Node<'tcx> {
 struct Analysis<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     config: &'a Config,
+    prohibited_ids: &'a [Vec<DefId>],
+    insulator_ids: &'a [Vec<DefId>],
     env: TypingEnv<'tcx>,
     nodes: Vec<Node<'tcx>>,
-    indices: HashMap<Instance<'tcx>, usize>,
+    indices: HashMap<(Instance<'tcx>, Vec<Value<'tcx>>, TypingEnv<'tcx>), usize>,
     changed: bool,
     limited: bool,
 }
@@ -60,26 +144,69 @@ pub fn check<'tcx>(cx: &LateContext<'tcx>, config: &Config) {
         return;
     }
     let tcx = cx.tcx;
+    let prohibited_ids: Vec<_> = config
+        .prohibited
+        .iter()
+        .map(|rule| crate::paths::resolve(tcx, &rule.path))
+        .collect();
+    let insulator_ids: Vec<_> = config
+        .insulators
+        .iter()
+        .map(|rule| crate::paths::resolve(tcx, &rule.path))
+        .collect();
+    let mut analysis = Analysis {
+        tcx,
+        config,
+        prohibited_ids: &prohibited_ids,
+        insulator_ids: &insulator_ids,
+        env: TypingEnv::fully_monomorphized(),
+        nodes: Vec::new(),
+        indices: HashMap::new(),
+        changed: false,
+        limited: false,
+    };
+    let mut async_owners = Vec::new();
     for owner in tcx.hir_body_owners() {
-        if !tcx.coroutine_is_async(owner.to_def_id()) {
+        let is_async = tcx.coroutine_is_async(owner.to_def_id())
+            || (matches!(tcx.def_kind(owner), DefKind::AssocFn)
+                && tcx.item_name(owner.to_def_id()).as_str() == "poll"
+                && tcx
+                    .trait_item_of(owner)
+                    .and_then(|item| tcx.trait_of_assoc(item))
+                    .is_some_and(|trait_id| Some(trait_id) == tcx.lang_items().future_trait()));
+        if is_async {
+            async_owners.push(owner);
+        }
+        // Seed function bodies to discover concrete coroutine captures even if
+        // the future is created in synchronous code or behind a generic helper.
+        if !is_async && !matches!(tcx.def_kind(owner), DefKind::Fn | DefKind::AssocFn) {
             continue;
         }
+        analysis.env = TypingEnv::post_analysis(tcx, owner);
         let instance = Instance::new_raw(
             owner.to_def_id(),
             ty::GenericArgs::identity_for_item(tcx, owner),
         );
-        let mut analysis = Analysis {
-            tcx,
-            config,
-            env: TypingEnv::post_analysis(tcx, owner),
-            nodes: Vec::new(),
-            indices: HashMap::new(),
-            changed: false,
-            limited: false,
-        };
         analysis.node(instance, Vec::new());
-        analysis.solve();
-        analysis.report(owner);
+    }
+    analysis.solve();
+    for owner in async_owners {
+        let mut roots: Vec<_> = analysis
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.instance.def_id() == owner.to_def_id())
+            .map(|(id, _)| id)
+            .collect();
+        // Prefer actual construction contexts over the open-world seed. The
+        // seed still checks unconstructed async functions and generic libraries.
+        if roots
+            .iter()
+            .any(|&id| !analysis.nodes[id].inputs.is_empty())
+        {
+            roots.retain(|&id| !analysis.nodes[id].inputs.is_empty());
+        }
+        analysis.report(owner, &roots);
     }
 }
 
@@ -94,13 +221,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
     }
 
     fn node(&mut self, instance: Instance<'tcx>, inputs: Vec<Value<'tcx>>) -> Option<usize> {
-        if let Some(&id) = self.indices.get(&instance) {
-            let node = &mut self.nodes[id];
-            node.inputs
-                .resize_with(node.inputs.len().max(inputs.len()), Value::default);
-            for (existing, incoming) in node.inputs.iter_mut().zip(inputs) {
-                self.changed |= existing.join(&incoming);
-            }
+        if let Some(&id) = self.indices.get(&(instance, inputs.clone(), self.env)) {
             return Some(id);
         }
         if self.nodes.len() >= self.config.max_instances {
@@ -112,11 +233,17 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             .config
             .prohibited
             .iter()
-            .position(|r| config::matches(&r.path, &path));
+            .enumerate()
+            .position(|(index, r)| {
+                self.prohibited_ids[index].contains(&instance.def_id())
+                    || config::matches(&r.path, &path)
+            });
         let id = self.nodes.len();
-        self.indices.insert(instance, id);
+        self.indices
+            .insert((instance, inputs.clone(), self.env), id);
         self.nodes.push(Node {
             instance,
+            env: self.env,
             inputs,
             output: Value::default(),
             edges: Vec::new(),
@@ -169,13 +296,13 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
     ) -> Value<'tcx> {
         let ty = self.instantiate_ty(instance, operand.ty(&body.local_decls, self.tcx));
         if let ty::FnDef(def_id, args) = *ty.kind() {
-            return Value(vec![Instance::new_raw(
+            return Value::function(Instance::new_raw(
                 def_id,
                 self.tcx.instantiate_bound_regions_with_erased(args),
-            )]);
+            ));
         }
         match operand {
-            Operand::Copy(place) | Operand::Move(place) => locals[place.local.as_usize()].clone(),
+            Operand::Copy(place) | Operand::Move(place) => place_value(locals, place),
             Operand::Constant(_) | Operand::RuntimeChecks(_) => Value::default(),
         }
     }
@@ -185,6 +312,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             return;
         }
         let instance = self.nodes[id].instance;
+        self.env = self.nodes[id].env;
         match instance.def {
             InstanceKind::Intrinsic(_) | InstanceKind::LlvmIntrinsic(_) => return,
             InstanceKind::Virtual(..) => {
@@ -207,16 +335,18 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             _ => {}
         }
         let body = self.tcx.instance_mir(instance.def);
+        let previous_edges = self.nodes[id].edges.clone();
         let mut locals = vec![Value::default(); body.local_decls.len()];
         for (local, input) in locals.iter_mut().skip(1).zip(&self.nodes[id].inputs) {
             local.join(input);
         }
         // Monotone, flow-insensitive may analysis within a body. Reassignment
         // retains both alternatives; loops and joins converge without recursion.
-        loop {
+        for round in 0..self.config.max_iterations {
             // Unresolved targets in an earlier round can become known after a
             // callee's return summary propagates. Report only the final round.
             self.nodes[id].incomplete.clear();
+            self.nodes[id].edges.clear();
             let mut changed = false;
             for block in body.basic_blocks.iter() {
                 for statement in &block.statements {
@@ -224,30 +354,54 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                         let (place, rvalue) = &**assignment;
                         let mut value = Value::default();
                         match rvalue {
-                            Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                            Rvalue::Use(op, _) => {
                                 value = self.operand(body, instance, &locals, op);
                             }
-                            Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
-                                value = locals[place.local.as_usize()].clone();
+                            Rvalue::Cast(_, op, _) => {
+                                value = self.operand(body, instance, &locals, op);
+                                let ty = self
+                                    .instantiate_ty(instance, op.ty(&body.local_decls, self.tcx));
+                                if let ty::Closure(def_id, args) = *ty.kind() {
+                                    value.targets.push(Instance::new_raw(def_id, args));
+                                }
                             }
-                            Rvalue::Aggregate(_, operands) => {
-                                for op in operands {
-                                    value.join(&self.operand(body, instance, &locals, op));
+                            Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                                value = place_value(&locals, place);
+                            }
+                            Rvalue::Aggregate(kind, operands) => {
+                                for (index, op) in operands.iter().enumerate() {
+                                    let field = self.operand(body, instance, &locals, op);
+                                    if field != Value::default() {
+                                        value.fields.insert(index, field);
+                                    }
+                                }
+                                if let AggregateKind::Coroutine(def_id, args) = **kind {
+                                    if def_id.is_local() {
+                                        let coroutine_ty =
+                                            Ty::new_coroutine(self.tcx, def_id, args);
+                                        let coroutine_ty =
+                                            self.instantiate_ty(instance, coroutine_ty);
+                                        if let ty::Coroutine(def_id, args) = *coroutine_ty.kind() {
+                                            // Lowered Future::poll receives Pin<&mut Self>.
+                                            let mut pinned = Value::default();
+                                            pinned.fields.insert(0, value.clone());
+                                            self.node(
+                                                Instance::new_raw(def_id, args),
+                                                vec![pinned, Value::default()],
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             _ => {}
                         }
-                        changed |= locals[place.local.as_usize()].join(&value);
+                        changed |= locals[place.local.as_usize()].assign(place.projection, &value);
                     }
                 }
                 let terminator = block.terminator();
                 match &terminator.kind {
-                    TerminatorKind::Call {
-                        func,
-                        args,
-                        destination,
-                        ..
-                    } => {
+                    TerminatorKind::Call { func, args, .. }
+                    | TerminatorKind::TailCall { func, args, .. } => {
                         let values: Vec<_> = args
                             .iter()
                             .map(|a| self.operand(body, instance, &locals, &a.node))
@@ -263,10 +417,10 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                             .collect();
                         let targets = self.operand(body, instance, &locals, func);
                         let mut returned = Value::default();
-                        if targets.0.is_empty() {
+                        if targets.targets.is_empty() {
                             self.incomplete(id, "unresolved function pointer call".into());
                         }
-                        for target in targets.0 {
+                        for target in targets.targets {
                             returned.join(&self.call(
                                 id,
                                 target,
@@ -275,7 +429,12 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                                 terminator.source_info.span,
                             ));
                         }
-                        changed |= locals[destination.local.as_usize()].join(&returned);
+                        if let TerminatorKind::Call { destination, .. } = terminator.kind {
+                            changed |= locals[destination.local.as_usize()]
+                                .assign(destination.projection, &returned);
+                        } else {
+                            changed |= locals[0].join(&returned);
+                        }
                     }
                     TerminatorKind::Drop { place, .. } => {
                         let ty =
@@ -285,7 +444,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                             self.edge(
                                 id,
                                 target,
-                                vec![locals[place.local.as_usize()].clone()],
+                                vec![place_value(&locals, place)],
                                 terminator.source_info.span,
                             );
                         }
@@ -296,8 +455,18 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             if !changed {
                 break;
             }
+            if round + 1 == self.config.max_iterations {
+                self.incomplete(
+                    id,
+                    "function-pointer dataflow iteration limit reached".into(),
+                );
+            }
+        }
+        if locals.iter().any(Value::is_truncated) {
+            self.incomplete(id, "callable aggregate nesting limit reached".into());
         }
         self.changed |= self.nodes[id].output.join(&locals[0]);
+        self.changed |= previous_edges != self.nodes[id].edges;
     }
 
     fn call(
@@ -309,13 +478,29 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         span: Span,
     ) -> Value<'tcx> {
         let path = self.path(target.def_id());
+        if self
+            .config
+            .prohibited
+            .iter()
+            .enumerate()
+            .any(|(index, rule)| {
+                self.prohibited_ids[index].contains(&target.def_id())
+                    || config::matches(&rule.path, &path)
+            })
+        {
+            return self.edge(caller, target, values, span);
+        }
         // Insulators are trusted execution contracts. Argument evaluation is
         // already represented by separate MIR statements/calls in the caller.
-        if let Some(rule) = self
+        if let Some((_, rule)) = self
             .config
             .insulators
             .iter()
-            .find(|r| config::matches(&r.path, &path))
+            .enumerate()
+            .find(|(index, r)| {
+                self.insulator_ids[*index].contains(&target.def_id())
+                    || config::matches(&r.path, &path)
+            })
         {
             let insulated = rule.callback_args.clone();
             if insulated.iter().any(|&index| index >= values.len()) {
@@ -328,7 +513,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 if insulated.contains(&index) {
                     continue;
                 }
-                for &callback in &value.0 {
+                for &callback in &value.targets {
                     self.edge(caller, callback, Vec::new(), span);
                 }
                 if let ty::Closure(def_id, args) = *types[index].peel_refs().kind() {
@@ -367,18 +552,19 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             .any(|edge| edge.target == id && edge.span == span)
         {
             self.nodes[caller].edges.push(Edge { target: id, span });
-            self.changed = true;
         }
         self.nodes[id].output.clone()
     }
 
-    fn report(&self, owner: LocalDefId) {
+    fn report(&self, owner: LocalDefId, roots: &[usize]) {
         let hir_id = self.tcx.local_def_id_to_hir_id(owner);
         let root_span = self.tcx.def_span(owner);
         let mut previous = vec![None; self.nodes.len()];
         let mut visited = vec![false; self.nodes.len()];
-        let mut queue = VecDeque::from([0]);
-        visited[0] = true;
+        let mut queue = VecDeque::from(roots.to_vec());
+        for &root in roots {
+            visited[root] = true;
+        }
         let mut reported = vec![false; self.config.prohibited.len()];
         let mut incomplete = Vec::new();
         while let Some(id) = queue.pop_front() {
