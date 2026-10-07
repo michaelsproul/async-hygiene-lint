@@ -19,7 +19,8 @@ use rustc_middle::{
 use rustc_span::Span;
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    time::Instant,
 };
 
 type Value<'tcx> = Provenance<Instance<'tcx>>;
@@ -109,6 +110,48 @@ struct Node<'tcx> {
     ancestry: Vec<Instance<'tcx>>,
 }
 
+#[derive(Default)]
+struct Statistics {
+    instances: usize,
+    instance_attempt: usize,
+    solver_iterations: usize,
+    dataflow_iterations: usize,
+    recursive_instances: usize,
+    solver_converged: bool,
+    exhausted: BTreeSet<&'static str>,
+}
+
+impl Statistics {
+    fn report(
+        &self,
+        tcx: TyCtxt<'_>,
+        depth: usize,
+        dataflow_converged: bool,
+        started: Instant,
+        skipped: bool,
+    ) {
+        tcx.dcx().note(format!(
+            "async hygiene statistics for `{}`: instances={}; peak-instance-attempt={}; solver-iterations={}; peak-dataflow-iterations={}; peak-aggregate-depth={}; peak-recursive-instances={}; solver-converged={}; dataflow-converged={}; exhausted-budgets=[{}]; elapsed-ms={:.3}; skipped={}",
+            tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE), self.instances,
+            self.instance_attempt, self.solver_iterations, self.dataflow_iterations,
+            depth, self.recursive_instances, self.solver_converged, dataflow_converged,
+            self.exhausted.iter().copied().collect::<Vec<_>>().join(","),
+            started.elapsed().as_secs_f64() * 1000.0,
+            if skipped { "no-local-async-entry-points" } else { "no" },
+        ));
+    }
+}
+
+fn is_async_owner(tcx: TyCtxt<'_>, owner: LocalDefId) -> bool {
+    tcx.coroutine_is_async(owner.to_def_id())
+        || (matches!(tcx.def_kind(owner), DefKind::AssocFn)
+            && tcx.item_name(owner.to_def_id()).as_str() == "poll"
+            && tcx
+                .trait_item_of(owner)
+                .and_then(|item| tcx.trait_of_assoc(item))
+                .is_some_and(|trait_id| Some(trait_id) == tcx.lang_items().future_trait()))
+}
+
 struct Analysis<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     config: &'a Config,
@@ -120,6 +163,7 @@ struct Analysis<'a, 'tcx> {
     changed: bool,
     exhausted: Vec<Exhaustion>,
     policy: Policy,
+    statistics: Statistics,
     current: Option<usize>,
 }
 
@@ -127,7 +171,22 @@ pub fn check<'tcx>(cx: &LateContext<'tcx>, config: &Config) {
     if config.prohibited.is_empty() {
         return;
     }
+    let started = Instant::now();
     let tcx = cx.tcx;
+    // Discover entry points before seeding synchronous functions. A crate with
+    // none has no local diagnostics to report, even if its sync code expands.
+    let owners: Vec<_> = tcx.hir_body_owners().collect();
+    let async_owners: Vec<_> = owners
+        .iter()
+        .copied()
+        .filter(|&owner| is_async_owner(tcx, owner))
+        .collect();
+    if async_owners.is_empty() {
+        if config.statistics {
+            Statistics::default().report(tcx, 0, false, started, true);
+        }
+        return;
+    }
     let prohibited_ids: Vec<_> = config
         .prohibited
         .iter()
@@ -153,20 +212,11 @@ pub fn check<'tcx>(cx: &LateContext<'tcx>, config: &Config) {
             observed_depth: Cell::new(0),
         },
         current: None,
+        statistics: Statistics::default(),
     };
-    let mut async_owners = Vec::new();
     let mut seeds = Vec::new();
-    for owner in tcx.hir_body_owners() {
-        let is_async = tcx.coroutine_is_async(owner.to_def_id())
-            || (matches!(tcx.def_kind(owner), DefKind::AssocFn)
-                && tcx.item_name(owner.to_def_id()).as_str() == "poll"
-                && tcx
-                    .trait_item_of(owner)
-                    .and_then(|item| tcx.trait_of_assoc(item))
-                    .is_some_and(|trait_id| Some(trait_id) == tcx.lang_items().future_trait()));
-        if is_async {
-            async_owners.push(owner);
-        }
+    for owner in owners {
+        let is_async = async_owners.contains(&owner);
         // Seed function bodies to discover concrete coroutine captures even if
         // the future is created in synchronous code or behind a generic helper.
         if !is_async && !matches!(tcx.def_kind(owner), DefKind::Fn | DefKind::AssocFn) {
@@ -210,6 +260,20 @@ pub fn check<'tcx>(cx: &LateContext<'tcx>, config: &Config) {
         }
         analysis.report(owner, &roots, &async_owners);
     }
+    if config.statistics {
+        let dataflow_converged = !analysis.nodes.iter().any(|node| {
+            node.exhausted
+                .iter()
+                .any(|reason| reason.key == "max-dataflow-iterations")
+        });
+        analysis.statistics.report(
+            tcx,
+            analysis.policy.observed_depth.get(),
+            dataflow_converged,
+            started,
+            false,
+        );
+    }
 }
 
 impl<'a, 'tcx> Analysis<'a, 'tcx> {
@@ -229,6 +293,10 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         if let Some(&id) = self.indices.get(&(instance, inputs.clone(), self.env)) {
             return Some(id);
         }
+        self.statistics.instance_attempt = self
+            .statistics
+            .instance_attempt
+            .max(self.nodes.len().saturating_add(1));
         if self.config.max_instances.exhausted(self.nodes.len()) {
             self.exhaustion(Exhaustion {
                 key: "max-instances",
@@ -258,6 +326,12 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             .iter()
             .filter(|ancestor| ancestor.def_id() == instance.def_id())
             .collect();
+        if matches!(instance.def, InstanceKind::Item(_)) {
+            self.statistics.recursive_instances = self
+                .statistics
+                .recursive_instances
+                .max(recursive.len().saturating_add(1));
+        }
         if matches!(instance.def, InstanceKind::Item(_))
             && self
                 .config
@@ -302,6 +376,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             exhausted: Vec::new(),
             ancestry,
         });
+        self.statistics.instances = self.nodes.len();
         self.changed = true;
         Some(id)
     }
@@ -326,7 +401,9 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 id += 1;
             }
             rounds = rounds.saturating_add(1);
+            self.statistics.solver_iterations = rounds;
             if !self.changed {
+                self.statistics.solver_converged = true;
                 return;
             }
             if self.config.max_iterations.exhausted(rounds) {
@@ -343,6 +420,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
     }
 
     fn exhaustion(&mut self, reason: Exhaustion) {
+        self.statistics.exhausted.insert(reason.key);
         let reasons = match self.current {
             Some(id) => &mut self.nodes[id].exhausted,
             None => &mut self.exhausted,
@@ -622,6 +700,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 break;
             }
         }
+        self.statistics.dataflow_iterations = self.statistics.dataflow_iterations.max(rounds);
         self.changed |= self.nodes[id].output.join(&locals[0], &self.policy);
         if locals.iter().any(Value::is_truncated) || self.nodes[id].output.is_truncated() {
             self.aggregate_exhaustion();

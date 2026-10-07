@@ -132,6 +132,24 @@ follow call edges to the affected async entry points; unfinished root discovery
 or global convergence is reported across the crate. Changing any setting in
 `dylint.toml` invalidates Cargo's cached lint results.
 
+Set `statistics = true` under `[async_hygiene]` to emit one statistics note per
+checked crate. It reports the instance count and attempted allocation high-water
+mark, solver rounds, maximum dataflow rounds per scan, attempted aggregate depth,
+recursive ancestry high-water mark, elapsed analysis time in milliseconds, and
+exhausted budget keys. High-water marks include provisional analysis work and
+attempts rejected by budgets. The exhausted-budget list records every budget hit
+during the run, even if a later scan converges. The note cap affects presentation
+only and is not recorded as analysis exhaustion.
+
+`solver-converged` describes the global fixed point; `dataflow-converged`
+describes all final body scans. Convergence does not imply complete coverage:
+budget truncation and unsupported calls still produce their own diagnostics.
+Crates without local async entry points skip analysis and report zero instances
+and rounds with `skipped=no-local-async-entry-points`; their convergence flags
+are false because no solver ran. Synchronous bodies are still seeded in crates
+with async entry points to discover concrete coroutine captures. Statistics are
+off by default; `prohibited = []` disables analysis and statistics entirely.
+
 Paths begin with the original Rust crate name (hyphens become underscores), even
 if a dependency is renamed locally. Exact paths resolve re-exports, inherent
 methods, and trait methods by definition identity. A `*` wildcard matches any
@@ -219,5 +237,11 @@ python3 tests/budgets.py
 The integration tests load the actual Dylint library, compile a three-crate
 fixture and real Tokio/futures dependencies, and verify exact diagnostic
 locations and counts, including safe cases and expected coverage warnings.
+The budget suite uses generated finite fixtures to exercise more than eight
+aggregate/recursive levels and more than 100 global/dataflow rounds, independently
+checks each budget and config cache invalidation, and verifies statistics and
+entry-point skipping. Each driver invocation has an external timeout, and timeout
+or compiler failure fails the suite. Future analysis cutoffs should use the same
+configurable policy and explicit exhaustion diagnostics.
 The compiler sources for the pinned toolchain are installed by `rustc-dev` under
 `lib/rustlib/rustc-src/rust/compiler`.

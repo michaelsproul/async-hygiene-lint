@@ -68,6 +68,12 @@ def complete(result):
     assert not findings(result, "async_hygiene_incomplete"), notes(result)
 
 
+def statistics(result):
+    messages = [m["message"] for m in result[0] if m["message"].startswith("async hygiene statistics for")]
+    assert len(messages) == 1, result
+    return dict(field.split("=", 1) for field in messages[0].split(": ", 1)[1].split("; "))
+
+
 def check():
     # Deep tuple construction, projection, and subfield assignment all use the
     # enclosing root's depth. This finite program requires more than eight levels.
@@ -80,7 +86,8 @@ def check():
     assert not prohibited(low)
     assert len(findings(low, "async_hygiene_incomplete")) == 1, low
     for depth in ("32", '"unlimited"'):
-        high = run(deep, f"max-aggregate-depth = {depth}\n")
+        high = run(deep, f"max-aggregate-depth = {depth}\nstatistics = true\n")
+        assert int(statistics(high)["peak-aggregate-depth"]) >= 12
         complete(high)
         assert prohibited(high)
 
@@ -102,7 +109,8 @@ def check():
     assert not prohibited(low)
     assert len(findings(low, "async_hygiene_incomplete")) == 1
     for limit in ("32", '"unlimited"'):
-        high = run(finite, f"max-recursive-instances = {limit}\n")
+        high = run(finite, f"max-recursive-instances = {limit}\nstatistics = true\n")
+        assert int(statistics(high)["peak-recursive-instances"]) > 8
         complete(high)
         assert prohibited(high)
 
@@ -131,7 +139,8 @@ def check():
     assert exhausted(low, "max-iterations"), notes(low)
     assert not exhausted(low, "max-dataflow-iterations")
     for limit in ("150", '"unlimited"'):
-        high = run(chain, f'max-iterations = {limit}\nmax-dataflow-iterations = "unlimited"\n')
+        high = run(chain, f'max-iterations = {limit}\nmax-dataflow-iterations = "unlimited"\nstatistics = true\n')
+        assert int(statistics(high)["solver-iterations"]) > 100
         complete(high)
         assert prohibited(high)
 
@@ -145,7 +154,8 @@ def check():
     assert not exhausted(low, "max-iterations")
     assert not prohibited(low)
     for limit in ("150", '"unlimited"'):
-        high = run(dataflow, f'max-iterations = "unlimited"\nmax-dataflow-iterations = {limit}\n')
+        high = run(dataflow, f'max-iterations = "unlimited"\nmax-dataflow-iterations = {limit}\nstatistics = true\n')
+        assert int(statistics(high)["peak-dataflow-iterations"]) > 100
         complete(high)
         assert prohibited(high)
 
@@ -188,6 +198,44 @@ def check():
     result = run(deep, unlimited, "-Ddisallowed_from_async", success=False)
     assert prohibited(result)
 
+    # Statistics are opt-in, report attempted work, and distinguish convergence
+    # from coverage. A synchronous-only expanding crate must do no analysis.
+    assert not any(m["message"].startswith("async hygiene statistics") for m in run(direct)[0])
+    for key in ("max-instances", "max-iterations", "max-dataflow-iterations"):
+        result = run(deep, f"{key} = 1\nstatistics = true\n")
+        stats = statistics(result)
+        assert key in stats["exhausted-budgets"], stats
+        if key == "max-instances":
+            assert stats["instances"] == "1" and stats["peak-instance-attempt"] == "2", stats
+        elif key == "max-iterations":
+            assert stats["solver-converged"] == "false", stats
+        else:
+            assert stats["dataflow-converged"] == "false", stats
+    result = run(expanding.split("pub async")[0], unlimited + "statistics = true\n")
+    complete(result)
+    stats = statistics(result)
+    assert stats["instances"] == stats["solver-iterations"] == "0", stats
+    assert stats["skipped"] == "no-local-async-entry-points", stats
+    assert stats["exhausted-budgets"] == "[]", stats
+
+    # Every supported async entry-point kind independently prevents the skip.
+    # The capture factory also verifies why synchronous seeding remains needed.
+    entries = [
+        direct,
+        "pub fn factory() { let f: fn() = bad; let _future = async move { f(); }; }",
+        "pub fn factory() { let _closure = async move || { bad(); }; }",
+        "pub struct Custom; impl std::future::Future for Custom { type Output = (); fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> { bad(); std::task::Poll::Ready(()) } }",
+    ]
+    for source in entries:
+        result = run(source, "statistics = true\n")
+        complete(result)
+        assert prohibited(result), result
+        stats = statistics(result)
+        assert stats["skipped"] == "no" and int(stats["instances"]) > 0, stats
+        assert stats["solver-converged"] == stats["dataflow-converged"] == "true", stats
+        assert stats["exhausted-budgets"] == "[]", stats
+        assert float(stats["elapsed-ms"]) >= 0, stats
+
     # Actual dylint.toml edits (not an environment override) must invalidate
     # Cargo's result for every setting, even when the source is unchanged.
     for key in KEYS:
@@ -201,4 +249,4 @@ with tempfile.TemporaryDirectory(prefix="budget-fixture-", dir=ROOT / "target") 
     (project / "src").mkdir()
     (project / "Cargo.toml").write_text('[package]\nname = "budget_fixture"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n')
     check()
-print("Verified all budgets, deep provenance, recursion, >100-round convergence, note elision, deny levels, and config invalidation.")
+print("Verified all budgets, deep provenance, recursion, >100-round convergence, note elision, deny levels, config invalidation, statistics, and entry-point skipping.")

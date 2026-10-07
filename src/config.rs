@@ -62,6 +62,7 @@ pub struct Config {
     pub max_aggregate_depth: Limit,
     pub max_recursive_instances: Limit,
     pub max_incomplete_notes: Limit,
+    pub statistics: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +133,7 @@ impl Default for Config {
             max_aggregate_depth: Limit::Finite(8),
             max_recursive_instances: Limit::Finite(8),
             max_incomplete_notes: Limit::Finite(5),
+            statistics: false,
         }
     }
 }
@@ -206,6 +208,7 @@ mod tests {
         assert_eq!(config.max_aggregate_depth, Limit::Finite(8));
         assert_eq!(config.max_recursive_instances, Limit::Finite(8));
         assert_eq!(config.max_incomplete_notes, Limit::Finite(5));
+        assert!(!config.statistics);
         for (text, expected) in [
             ("123", Limit::Finite(123)),
             ("'unlimited'", Limit::Unlimited),

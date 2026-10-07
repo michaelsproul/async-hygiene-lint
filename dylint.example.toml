@@ -14,6 +14,9 @@ max-aggregate-depth = 8
 max-recursive-instances = 8
 # Budget exhaustion is always printed, independently of this other-note cap.
 max-incomplete-notes = 5
+# Emit per-crate counts, high-water marks, convergence, elapsed time, and all
+# exhausted budgets (including those hit during provisional analysis work).
+statistics = false
 
 prohibited = [
     { path = "tokio::runtime::Handle::block_on", reason = "nested runtimes panic" },
