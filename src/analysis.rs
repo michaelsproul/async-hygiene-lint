@@ -1,6 +1,7 @@
 use crate::{
     ASYNC_HYGIENE_INCOMPLETE, DISALLOWED_FROM_ASYNC,
-    config::{self, Config},
+    config::{self, Config, Limit},
+    value::{Policy, Value as Provenance},
 };
 use rustc_errors::DiagDecorator;
 use rustc_hir::{
@@ -16,104 +17,44 @@ use rustc_middle::{
     ty::{self, EarlyBinder, Instance, InstanceKind, Ty, TyCtxt, TypeVisitableExt, TypingEnv},
 };
 use rustc_span::Span;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet, VecDeque},
+};
 
-/// Callable provenance is field-sensitive. References retain the pointee's
-/// abstract value; array indices conservatively join all possible elements.
-#[derive(Clone, Default, PartialEq, Eq, Hash)]
-struct Value<'tcx> {
-    targets: Vec<Instance<'tcx>>,
-    fields: BTreeMap<usize, Value<'tcx>>,
-    truncated: bool,
-    unknown: bool,
+type Value<'tcx> = Provenance<Instance<'tcx>>;
+
+fn place_value<'tcx>(locals: &[Value<'tcx>], place: &Place<'tcx>, policy: &Policy) -> Value<'tcx> {
+    let mut value = locals[place.local.as_usize()].clone();
+    for elem in place.projection {
+        match elem {
+            ProjectionElem::Field(field, _) => {
+                value = value.project(Some(field.as_usize()), policy)
+            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                value = value.project(None, policy)
+            }
+            _ => {}
+        }
+    }
+    value
 }
 
-impl<'tcx> Value<'tcx> {
-    fn function(target: Instance<'tcx>) -> Self {
-        Self {
-            targets: vec![target],
-            ..Self::default()
-        }
-    }
-
-    fn is_truncated(&self) -> bool {
-        self.truncated || self.fields.values().any(Self::is_truncated)
-    }
-
-    fn join(&mut self, other: &Self) -> bool {
-        self.join_at_depth(other, 0)
-    }
-
-    fn join_at_depth(&mut self, other: &Self, depth: usize) -> bool {
-        let mut changed = false;
-        if other.unknown && !self.unknown {
-            self.unknown = true;
-            changed = true;
-        }
-        for target in &other.targets {
-            if !self.targets.contains(target) {
-                self.targets.push(*target);
-                changed = true;
-            }
-        }
-        let truncated = other.truncated || (depth >= 8 && !other.fields.is_empty());
-        if truncated && !self.truncated {
-            self.truncated = true;
-            changed = true;
-        }
-        if depth < 8 {
-            for (field, value) in &other.fields {
-                changed |= self
-                    .fields
-                    .entry(*field)
-                    .or_default()
-                    .join_at_depth(value, depth + 1);
-            }
-        }
-        changed
-    }
-
-    fn projected(&self, projection: &[PlaceElem<'tcx>]) -> Self {
-        let Some((first, rest)) = projection.split_first() else {
-            return self.clone();
-        };
-        match first {
-            ProjectionElem::Field(field, _) => self
-                .fields
-                .get(&field.as_usize())
-                .map_or_else(Self::default, |value| value.projected(rest)),
-            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
-                let mut value = Self::default();
-                for field in self.fields.values() {
-                    value.join(&field.projected(rest));
-                }
-                value
-            }
-            _ => self.projected(rest),
-        }
-    }
-
-    fn assign(&mut self, projection: &[PlaceElem<'tcx>], value: &Self) -> bool {
-        let Some((first, rest)) = projection.split_first() else {
-            return self.join(value);
-        };
-        match first {
-            ProjectionElem::Field(field, _) => self
-                .fields
-                .entry(field.as_usize())
-                .or_default()
-                .assign(rest, value),
-            // Array indices are represented by one joined element for writes.
-            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
-                self.fields.entry(0).or_default().assign(rest, value)
-            }
-            _ => self.assign(rest, value),
-        }
-    }
-}
-
-fn place_value<'tcx>(locals: &[Value<'tcx>], place: &Place<'tcx>) -> Value<'tcx> {
-    locals[place.local.as_usize()].projected(place.projection)
+fn assign<'tcx>(
+    value: &mut Value<'tcx>,
+    projection: &[PlaceElem<'tcx>],
+    other: &Value<'tcx>,
+    policy: &Policy,
+) -> bool {
+    let path: Vec<_> = projection
+        .iter()
+        .filter_map(|elem| match elem {
+            ProjectionElem::Field(field, _) => Some(field.as_usize()),
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => Some(0),
+            _ => None,
+        })
+        .collect();
+    value.assign(&path, other, policy)
 }
 
 /// Count unique type components, skipping shared subtrees. Expanding `(T, T)`
@@ -131,6 +72,24 @@ fn type_size(instance: Instance<'_>) -> usize {
     seen.len()
 }
 
+/// Budget failures stay separate from unsupported MIR/dispatch diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+struct Exhaustion {
+    key: &'static str,
+    limit: Limit,
+    observed: usize,
+    context: String,
+}
+
+impl Exhaustion {
+    fn message(&self) -> String {
+        format!(
+            "{}={} {}; observed/attempted count {}",
+            self.key, self.limit, self.context, self.observed
+        )
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct Edge {
     target: usize,
@@ -146,6 +105,7 @@ struct Node<'tcx> {
     discovered: Vec<usize>,
     prohibited: Option<usize>,
     incomplete: Vec<String>,
+    exhausted: Vec<Exhaustion>,
     ancestry: Vec<Instance<'tcx>>,
 }
 
@@ -158,7 +118,8 @@ struct Analysis<'a, 'tcx> {
     nodes: Vec<Node<'tcx>>,
     indices: HashMap<(Instance<'tcx>, Vec<Value<'tcx>>, TypingEnv<'tcx>), usize>,
     changed: bool,
-    limited: bool,
+    exhausted: Vec<Exhaustion>,
+    policy: Policy,
     current: Option<usize>,
 }
 
@@ -186,7 +147,11 @@ pub fn check<'tcx>(cx: &LateContext<'tcx>, config: &Config) {
         nodes: Vec::new(),
         indices: HashMap::new(),
         changed: false,
-        limited: false,
+        exhausted: Vec::new(),
+        policy: Policy {
+            depth: config.max_aggregate_depth,
+            observed_depth: Cell::new(0),
+        },
         current: None,
     };
     let mut async_owners = Vec::new();
@@ -258,11 +223,29 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
     }
 
     fn node(&mut self, instance: Instance<'tcx>, inputs: Vec<Value<'tcx>>) -> Option<usize> {
+        if self.current.is_some() && inputs.iter().any(Value::is_truncated) {
+            self.aggregate_exhaustion();
+        }
         if let Some(&id) = self.indices.get(&(instance, inputs.clone(), self.env)) {
             return Some(id);
         }
-        if self.nodes.len() >= self.config.max_instances {
-            self.limited = true;
+        if self.config.max_instances.exhausted(self.nodes.len()) {
+            self.exhaustion(Exhaustion {
+                key: "max-instances",
+                limit: self.config.max_instances,
+                observed: self.nodes.len().saturating_add(1),
+                context: format!(
+                    "prevented allocation of `{}`{}",
+                    self.path(instance.def_id()),
+                    self.current.map_or_else(
+                        || " during root discovery".into(),
+                        |id| format!(
+                            " called from `{}`",
+                            self.path(self.nodes[id].instance.def_id())
+                        )
+                    )
+                ),
+            });
             return None;
         }
         let mut ancestry = self
@@ -276,15 +259,21 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             .filter(|ancestor| ancestor.def_id() == instance.def_id())
             .collect();
         if matches!(instance.def, InstanceKind::Item(_))
-            && recursive.len() >= 8
+            && self
+                .config
+                .max_recursive_instances
+                .exhausted(recursive.len())
             && type_size(instance) >= type_size(**recursive.last().unwrap())
         {
-            if let Some(caller) = self.current {
-                self.incomplete(caller, format!(
-                    "recursive instance expansion limit reached at `{}` (eight instances per function unless types shrink)",
+            self.exhaustion(Exhaustion {
+                key: "max-recursive-instances",
+                limit: self.config.max_recursive_instances,
+                observed: recursive.len().saturating_add(1),
+                context: format!(
+                    "prevented non-shrinking expansion of `{}` along the current ancestry",
                     self.path(instance.def_id())
-                ));
-            }
+                ),
+            });
             return None;
         }
         ancestry.push(instance);
@@ -310,6 +299,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             discovered: Vec::new(),
             prohibited,
             incomplete: Vec::new(),
+            exhausted: Vec::new(),
             ancestry,
         });
         self.changed = true;
@@ -325,7 +315,8 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
     }
 
     fn solve(&mut self) {
-        for _ in 0..self.config.max_iterations {
+        let mut rounds = 0usize;
+        loop {
             self.changed = false;
             let mut id = 0;
             // Discover callees in the same pass; the next pass propagates returns
@@ -334,11 +325,46 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 self.scan(id);
                 id += 1;
             }
+            rounds = rounds.saturating_add(1);
             if !self.changed {
                 return;
             }
+            if self.config.max_iterations.exhausted(rounds) {
+                self.current = None;
+                self.exhaustion(Exhaustion {
+                    key: "max-iterations",
+                    limit: self.config.max_iterations,
+                    observed: rounds,
+                    context: "stopped the crate-wide solver before convergence".into(),
+                });
+                return;
+            }
         }
-        self.limited = true;
+    }
+
+    fn exhaustion(&mut self, reason: Exhaustion) {
+        let reasons = match self.current {
+            Some(id) => &mut self.nodes[id].exhausted,
+            None => &mut self.exhausted,
+        };
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+
+    fn aggregate_exhaustion(&mut self) {
+        if let Limit::Finite(limit) = self.config.max_aggregate_depth {
+            self.exhaustion(Exhaustion {
+                key: "max-aggregate-depth",
+                limit: self.config.max_aggregate_depth,
+                observed: limit.saturating_add(1),
+                context: format!(
+                    "prevented propagation at field depth {} in `{}`",
+                    limit.saturating_add(1),
+                    self.path(self.nodes[self.current.unwrap()].instance.def_id())
+                ),
+            });
+        }
     }
 
     fn incomplete(&mut self, id: usize, message: String) {
@@ -372,11 +398,12 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             ));
         }
         match operand {
-            Operand::Copy(place) | Operand::Move(place) => place_value(locals, place),
-            Operand::Constant(_) if matches!(ty.kind(), ty::FnPtr(..)) => Value {
-                unknown: true,
-                ..Value::default()
-            },
+            Operand::Copy(place) | Operand::Move(place) => place_value(locals, place, &self.policy),
+            Operand::Constant(_) if matches!(ty.kind(), ty::FnPtr(..)) => {
+                let mut value = Value::default();
+                value.root.unknown = true;
+                value
+            }
             Operand::Constant(_) | Operand::RuntimeChecks(_) => Value::default(),
         }
     }
@@ -421,7 +448,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         let previous_discovered = self.nodes[id].discovered.clone();
         let mut locals = vec![Value::default(); body.local_decls.len()];
         for (local, input) in locals.iter_mut().skip(1).zip(&self.nodes[id].inputs) {
-            local.join(input);
+            local.join(input, &self.policy);
         }
         for argument in (self.nodes[id].inputs.len() + 1)..=body.arg_count {
             let ty = self.instantiate_ty(
@@ -429,15 +456,17 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 body.local_decls[rustc_middle::mir::Local::from_usize(argument)].ty,
             );
             if matches!(ty.peel_refs().kind(), ty::FnPtr(..)) {
-                locals[argument].unknown = true;
+                locals[argument].root.unknown = true;
             }
         }
         // Monotone, flow-insensitive may analysis within a body. Reassignment
         // retains both alternatives; loops and joins converge without recursion.
-        for round in 0..self.config.max_iterations {
+        let mut rounds = 0usize;
+        loop {
             // Unresolved targets in an earlier round can become known after a
             // callee's return summary propagates. Report only the final round.
             self.nodes[id].incomplete.clear();
+            self.nodes[id].exhausted.clear();
             self.nodes[id].edges.clear();
             self.nodes[id].discovered.clear();
             let mut changed = false;
@@ -455,25 +484,27 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                                 let ty = self
                                     .instantiate_ty(instance, op.ty(&body.local_decls, self.tcx));
                                 if let ty::Closure(def_id, args) = *ty.kind() {
-                                    value.targets.push(Instance::new_raw(def_id, args));
+                                    value.root.targets.push(Instance::new_raw(def_id, args));
                                 }
                             }
                             Rvalue::Ref(_, _, place)
                             | Rvalue::RawPtr(_, place)
                             | Rvalue::CopyForDeref(place)
                             | Rvalue::Reborrow(_, _, place) => {
-                                value = place_value(&locals, place);
+                                value = place_value(&locals, place, &self.policy);
                             }
                             Rvalue::Repeat(op, _) => {
-                                value
-                                    .fields
-                                    .insert(0, self.operand(body, instance, &locals, op));
+                                value.assign(
+                                    &[0],
+                                    &self.operand(body, instance, &locals, op),
+                                    &self.policy,
+                                );
                             }
                             Rvalue::Aggregate(kind, operands) => {
                                 for (index, op) in operands.iter().enumerate() {
                                     let field = self.operand(body, instance, &locals, op);
                                     if field != Value::default() {
-                                        value.fields.insert(index, field);
+                                        value.assign(&[index], &field, &self.policy);
                                     }
                                 }
                                 if let AggregateKind::Coroutine(def_id, args) = **kind {
@@ -485,7 +516,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                                         if let ty::Coroutine(def_id, args) = *coroutine_ty.kind() {
                                             // Lowered Future::poll receives Pin<&mut Self>.
                                             let mut pinned = Value::default();
-                                            pinned.fields.insert(0, value.clone());
+                                            pinned.assign(&[0], &value, &self.policy);
                                             self.discover(
                                                 id,
                                                 Instance::new_raw(def_id, args),
@@ -497,7 +528,12 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                             }
                             _ => {}
                         }
-                        changed |= locals[place.local.as_usize()].assign(place.projection, &value);
+                        changed |= assign(
+                            &mut locals[place.local.as_usize()],
+                            place.projection,
+                            &value,
+                            &self.policy,
+                        );
                     }
                 }
                 let terminator = block.terminator();
@@ -519,23 +555,28 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                             .collect();
                         let targets = self.operand(body, instance, &locals, func);
                         let mut returned = Value::default();
-                        if targets.targets.is_empty() || targets.unknown {
+                        if targets.root.targets.is_empty() || targets.root.unknown {
                             self.incomplete(id, "unresolved function pointer call".into());
                         }
-                        for target in targets.targets {
-                            returned.join(&self.call(
+                        for target in targets.root.targets {
+                            let output = self.call(
                                 id,
                                 target,
                                 values.clone(),
                                 &types,
                                 terminator.source_info.span,
-                            ));
+                            );
+                            returned.join(&output, &self.policy);
                         }
                         if let TerminatorKind::Call { destination, .. } = terminator.kind {
-                            changed |= locals[destination.local.as_usize()]
-                                .assign(destination.projection, &returned);
+                            changed |= assign(
+                                &mut locals[destination.local.as_usize()],
+                                destination.projection,
+                                &returned,
+                                &self.policy,
+                            );
                         } else {
-                            changed |= locals[0].join(&returned);
+                            changed |= locals[0].join(&returned, &self.policy);
                         }
                     }
                     TerminatorKind::Drop { place, .. } => {
@@ -546,7 +587,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                             self.edge(
                                 id,
                                 target,
-                                vec![place_value(&locals, place)],
+                                vec![place_value(&locals, place, &self.policy)],
                                 terminator.source_info.span,
                             );
                         } else if ty.has_non_region_param() && ty.needs_drop(self.tcx, self.env) {
@@ -559,20 +600,32 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                     _ => {}
                 }
             }
+            rounds = rounds.saturating_add(1);
             if !changed {
                 break;
             }
-            if round + 1 == self.config.max_iterations {
-                self.incomplete(
-                    id,
-                    "function-pointer dataflow iteration limit reached".into(),
-                );
+            if self.config.dataflow_iterations().exhausted(rounds) {
+                self.exhaustion(Exhaustion {
+                    key: "max-dataflow-iterations",
+                    limit: self.config.dataflow_iterations(),
+                    observed: rounds,
+                    context: format!(
+                        "stopped function-pointer dataflow before convergence in `{}`{}",
+                        self.path(instance.def_id()),
+                        if self.config.max_dataflow_iterations.is_none() {
+                            " (inherited from max-iterations)"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+                break;
             }
         }
-        if locals.iter().any(Value::is_truncated) {
-            self.incomplete(id, "callable aggregate nesting limit reached".into());
+        self.changed |= self.nodes[id].output.join(&locals[0], &self.policy);
+        if locals.iter().any(Value::is_truncated) || self.nodes[id].output.is_truncated() {
+            self.aggregate_exhaustion();
         }
-        self.changed |= self.nodes[id].output.join(&locals[0]);
         self.changed |= previous_edges != self.nodes[id].edges;
         self.changed |= previous_discovered != self.nodes[id].discovered;
     }
@@ -619,7 +672,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 return Value::default();
             }
             for (index, value) in values.iter().enumerate() {
-                for &callback in &value.targets {
+                for &callback in &value.root.targets {
                     if insulated.contains(&index) {
                         // Discover async blocks constructed on the blocking
                         // thread without propagating its synchronous effects.
@@ -679,6 +732,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         }
         let mut reported = vec![false; self.config.prohibited.len()];
         let mut incomplete = Vec::new();
+        let mut exhausted = self.exhausted.clone();
         while let Some(id) = queue.pop_front() {
             let node = &self.nodes[id];
             if let Some(local) = node.instance.def_id().as_local()
@@ -712,6 +766,11 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                     }));
                 }
             }
+            for reason in &node.exhausted {
+                if !exhausted.contains(reason) {
+                    exhausted.push(reason.clone());
+                }
+            }
             for message in &node.incomplete {
                 if !incomplete.contains(message) {
                     incomplete.push(message.clone());
@@ -725,7 +784,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 }
             }
         }
-        if self.limited || !incomplete.is_empty() {
+        if !exhausted.is_empty() || !incomplete.is_empty() {
             self.tcx.emit_node_span_lint(
                 ASYNC_HYGIENE_INCOMPLETE,
                 hir_id,
@@ -734,19 +793,23 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                     diag.primary_message(
                         "async hygiene analysis is incomplete for this async context",
                     );
-                    for message in incomplete.iter().take(5) {
-                        diag.note((*message).clone());
+                    // Budget failures are never hidden by ordinary note elision.
+                    let mut helped = HashSet::new();
+                    for reason in &exhausted {
+                        diag.note(reason.message());
+                        if helped.insert(reason.key) {
+                            diag.help(format!("raise async_hygiene.{} or set it to \"unlimited\"", reason.key));
+                        }
                     }
-                    if incomplete.len() > 5 {
-                        diag.note(format!(
-                            "{} additional unresolved calls",
-                            incomplete.len() - 5
-                        ));
+                    let shown = match self.config.max_incomplete_notes {
+                        Limit::Finite(limit) => incomplete.len().min(limit),
+                        Limit::Unlimited => incomplete.len(),
+                    };
+                    for message in &incomplete[..shown] {
+                        diag.note(message.clone());
                     }
-                    if self.limited {
-                        diag.note(
-                            "analysis work limit reached; increase max-instances or max-iterations",
-                        );
+                    if incomplete.len() > shown {
+                        diag.note(format!("{} additional incomplete reasons omitted; raise async_hygiene.max-incomplete-notes or set it to \"unlimited\"", incomplete.len() - shown));
                     }
                 }),
             );

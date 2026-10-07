@@ -89,6 +89,49 @@ Each provided array **replaces** its default array; omitted fields retain their
 defaults. `prohibited = []` disables the analysis. Unknown fields and invalid
 limits are configuration errors.
 
+All budgets accept a positive integer or the string `"unlimited"`. Zero,
+negative numbers, and other strings are rejected.
+
+| Setting | Default | Scope |
+| --- | --- | --- |
+| `max-instances` | `10000` | Distinct analysis instances per crate |
+| `max-iterations` | `100` | Global solver rounds |
+| `max-dataflow-iterations` | Inherits `max-iterations` | Function-pointer dataflow rounds per body scan |
+| `max-aggregate-depth` | `8` | Callable provenance field depth; the root is depth zero and each aggregate field adds one |
+| `max-recursive-instances` | `8` | Matching function definitions along the current instance ancestry, unless types shrink |
+| `max-incomplete-notes` | `5` | Non-budget details per incomplete diagnostic; budget exhaustion is always shown |
+
+Existing instances are reused before checking expansion budgets. The recursive
+limit counts ancestors on the current expansion path, not all instances of a
+function across the crate. References do not increase aggregate field depth;
+subfield assignments consume the enclosing value's remaining depth budget.
+
+For example, to keep most defaults while allowing deeper aggregates and unlimited
+solver convergence:
+
+```toml
+[async_hygiene]
+max-aggregate-depth = 32
+max-iterations = "unlimited"
+max-dataflow-iterations = 500
+max-incomplete-notes = "unlimited"
+```
+
+`"unlimited"` removes that budget check entirely. Independently configured
+budgets remain active, and iteration loops still stop on convergence. Disabling
+all budgets does not guarantee termination or bounded memory: polymorphic
+recursion can keep creating instances, and aggregate provenance can keep growing.
+For CI, an external timeout or memory limit should fail the job if analysis is
+cancelled or runs out of resources. Unlimited budgets do not remove coverage
+warnings for missing MIR, dynamic dispatch, or unresolved calls, and do not
+change enforcement of `disallowed_from_async`.
+
+Exhaustion diagnostics identify the configuration key, limit, observed or
+attempted count, and affected function or crate-wide operation. Local failures
+follow call edges to the affected async entry points; unfinished root discovery
+or global convergence is reported across the crate. Changing any setting in
+`dylint.toml` invalidates Cargo's cached lint results.
+
 Paths begin with the original Rust crate name (hyphens become underscores), even
 if a dependency is renamed locally. Exact paths resolve re-exports, inherent
 methods, and trait methods by definition identity. A `*` wildcard matches any
@@ -156,11 +199,9 @@ This is a conservative static lint, not a proof of runtime safety:
   are traversed when reached; use `--workspace --all-targets` to check entry
   points across your workspace. Uncompiled feature/target combinations are not
   analyzed.
-* Analysis is bounded by the configured instance and iteration limits, plus an
-  aggregate provenance nesting limit of eight and eight distinct instances of
-  one function along a recursive expansion unless its types shrink (as in
-  structural drop glue). Ordinary recursive calls reuse
-  their existing summaries. Exhaustion reports incomplete
+* Analysis uses the configurable budgets above, with finite defaults. Ordinary
+  recursion reuses existing summaries, and shrinking types retain their recursive
+  expansion exception (as in structural drop glue). Exhaustion reports incomplete
   analysis instead of silently truncating a safety conclusion.
 
 ## Development
@@ -172,6 +213,7 @@ python3 tests/check.py
 python3 tests/check.py tokio
 python3 tests/check.py limits
 python3 tests/controls.py
+python3 tests/budgets.py
 ```
 
 The integration tests load the actual Dylint library, compile a three-crate

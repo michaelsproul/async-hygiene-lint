@@ -58,7 +58,7 @@ assert any("out-of-range callback argument" in m["message"] for m in messages), 
 
 result, messages = run("[async_hygiene]\nmax-instances = 1")
 assert result.returncode == 0, result.stderr
-assert any((m.get("code") or {}).get("code") == "async_hygiene_incomplete" and any("work limit" in child["message"] for child in m["children"]) for m in messages), messages
+assert any((m.get("code") or {}).get("code") == "async_hygiene_incomplete" and any("max-instances=1" in child["message"] for child in m["children"]) for m in messages), messages
 
 # Without dependency MIR, lack of a transitive warning must be accompanied by
 # an explicit coverage diagnostic. Use a separate Cargo artifact directory.

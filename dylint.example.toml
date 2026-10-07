@@ -1,8 +1,19 @@
 # Copy this file to the root of the workspace you want to lint as dylint.toml.
 # Each supplied array replaces that default array in its entirety.
 [async_hygiene]
+# Every budget accepts a positive integer or "unlimited" (no budget check).
+# Unlimited analysis may not terminate or fit in memory; CI can impose a timeout.
 max-instances = 10000
 max-iterations = 100
+# Omit this to inherit max-iterations, including its "unlimited" setting.
+# max-dataflow-iterations = 100
+# Root depth is zero; each aggregate field consumes one level, including writes.
+max-aggregate-depth = 8
+# Matching ancestors of the same function; existing summaries and shrinking
+# types retain their exceptions. This is not a crate-wide per-function count.
+max-recursive-instances = 8
+# Budget exhaustion is always printed, independently of this other-note cap.
+max-incomplete-notes = 5
 
 prohibited = [
     { path = "tokio::runtime::Handle::block_on", reason = "nested runtimes panic" },

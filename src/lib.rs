@@ -10,6 +10,7 @@ extern crate rustc_span;
 mod analysis;
 mod config;
 mod paths;
+mod value;
 
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint, impl_lint_pass};

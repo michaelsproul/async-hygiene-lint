@@ -19,3 +19,4 @@ jobs:
           python3 tests/check.py tokio
           python3 tests/check.py limits
           python3 tests/controls.py
+          python3 tests/budgets.py
