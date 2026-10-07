@@ -1,0 +1,22 @@
+[package]
+name = "async_hygiene"
+version = "0.1.0"
+edition = "2024"
+description = "Interprocedural async hygiene analysis for Dylint"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "=6.1.0"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+toml = "1"
+
+[workspace]
+
+[package.metadata.rust-analyzer]
+rustc_private = true

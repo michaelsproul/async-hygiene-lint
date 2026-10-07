@@ -1,0 +1,10 @@
+[package]
+name = "hygiene_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bridge = { path = "../bridge" }
+
+[workspace]

@@ -1,0 +1,9 @@
+[async_hygiene]
+prohibited = [
+    { path = "hygiene_fixture::bad", reason = "test blocking operation" },
+    { path = "hygiene_fixture::other_bad" },
+    { path = "blocking::bad" },
+]
+insulators = [
+    { path = "hygiene_fixture::offload", callback-args = [0] },
+]
