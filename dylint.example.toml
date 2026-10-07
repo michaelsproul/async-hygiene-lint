@@ -12,7 +12,8 @@ max-aggregate-depth = 8
 # Matching ancestors of the same function; existing summaries and shrinking
 # types retain their exceptions. This is not a crate-wide per-function count.
 max-recursive-instances = 8
-# Budget exhaustion is always printed, independently of this other-note cap.
+# At least one note per exhausted budget is always printed, even at a small cap.
+# Repeated budget failures share the remaining allowance with other details.
 max-incomplete-notes = 5
 # Emit per-crate counts, high-water marks, convergence, elapsed time, and all
 # exhausted budgets (including those hit during provisional analysis work).

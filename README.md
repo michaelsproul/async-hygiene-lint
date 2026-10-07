@@ -99,12 +99,16 @@ negative numbers, and other strings are rejected.
 | `max-dataflow-iterations` | Inherits `max-iterations` | Function-pointer dataflow rounds per body scan |
 | `max-aggregate-depth` | `8` | Callable provenance field depth; the root is depth zero and each aggregate field adds one |
 | `max-recursive-instances` | `8` | Matching function definitions along the current instance ancestry, unless types shrink |
-| `max-incomplete-notes` | `5` | Non-budget details per incomplete diagnostic; budget exhaustion is always shown |
+| `max-incomplete-notes` | `5` | Details per incomplete diagnostic; at least one note per exhausted budget is always shown |
 
 Existing instances are reused before checking expansion budgets. The recursive
 limit counts ancestors on the current expansion path, not all instances of a
 function across the crate. References do not increase aggregate field depth;
 subfield assignments consume the enclosing value's remaining depth budget.
+Each exhausted budget gets a note before other details, even if this exceeds a
+small note allowance. Further occurrences of that budget share the remaining
+allowance with unsupported-call details. The elision summary counts all omitted
+reasons; `"unlimited"` prints every detail.
 
 For example, to keep most defaults while allowing deeper aggregates and unlimited
 solver convergence:
@@ -128,8 +132,10 @@ change enforcement of `disallowed_from_async`.
 
 Exhaustion diagnostics identify the configuration key, limit, observed or
 attempted count, and affected function or crate-wide operation. Local failures
-follow call edges to the affected async entry points; unfinished root discovery
-or global convergence is reported across the crate. Changing any setting in
+follow call edges to the affected async entry points. Instance exhaustion and
+unfinished global convergence are reported across the crate: the shared instance
+pool also supports root discovery through synchronous constructors, whose missing
+captures may have no call edge from an async entry point. Changing any setting in
 `dylint.toml` invalidates Cargo's cached lint results.
 
 Set `statistics = true` under `[async_hygiene]` to emit one statistics note per

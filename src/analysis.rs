@@ -298,7 +298,10 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             .instance_attempt
             .max(self.nodes.len().saturating_add(1));
         if self.config.max_instances.exhausted(self.nodes.len()) {
-            self.exhaustion(Exhaustion {
+            // The allocation pool is shared with coroutine/capture discovery
+            // in synchronous bodies. A rejected instance can hide a root that
+            // has no call edge from the async contexts we managed to discover.
+            self.global_exhaustion(Exhaustion {
                 key: "max-instances",
                 limit: self.config.max_instances,
                 observed: self.nodes.len().saturating_add(1),
@@ -407,8 +410,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 return;
             }
             if self.config.max_iterations.exhausted(rounds) {
-                self.current = None;
-                self.exhaustion(Exhaustion {
+                self.global_exhaustion(Exhaustion {
                     key: "max-iterations",
                     limit: self.config.max_iterations,
                     observed: rounds,
@@ -427,6 +429,13 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         };
         if !reasons.contains(&reason) {
             reasons.push(reason);
+        }
+    }
+
+    fn global_exhaustion(&mut self, reason: Exhaustion) {
+        self.statistics.exhausted.insert(reason.key);
+        if !self.exhausted.contains(&reason) {
+            self.exhausted.push(reason);
         }
     }
 
@@ -872,23 +881,28 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                     diag.primary_message(
                         "async hygiene analysis is incomplete for this async context",
                     );
-                    // Budget failures are never hidden by ordinary note elision.
+                    // Always identify each exhausted budget. Further occurrences
+                    // share the note allowance with unsupported-call details.
                     let mut helped = HashSet::new();
+                    let mut details = Vec::new();
                     for reason in &exhausted {
-                        diag.note(reason.message());
                         if helped.insert(reason.key) {
+                            diag.note(reason.message());
                             diag.help(format!("raise async_hygiene.{} or set it to \"unlimited\"", reason.key));
+                        } else {
+                            details.push(reason.message());
                         }
                     }
+                    details.extend(incomplete);
                     let shown = match self.config.max_incomplete_notes {
-                        Limit::Finite(limit) => incomplete.len().min(limit),
-                        Limit::Unlimited => incomplete.len(),
+                        Limit::Finite(limit) => details.len().min(limit.saturating_sub(helped.len())),
+                        Limit::Unlimited => details.len(),
                     };
-                    for message in &incomplete[..shown] {
+                    for message in &details[..shown] {
                         diag.note(message.clone());
                     }
-                    if incomplete.len() > shown {
-                        diag.note(format!("{} additional incomplete reasons omitted; raise async_hygiene.max-incomplete-notes or set it to \"unlimited\"", incomplete.len() - shown));
+                    if details.len() > shown {
+                        diag.note(format!("{} additional incomplete reasons omitted; raise async_hygiene.max-incomplete-notes or set it to \"unlimited\"", details.len() - shown));
                     }
                 }),
             );

@@ -174,6 +174,15 @@ def check():
     complete(high)
     assert prohibited(high)
 
+    # Four open-world seeds fit, but constructing the concrete coroutine does
+    # not. The synchronous factory is not reachable from the async call graph;
+    # its exhausted allocation budget must still reach the async diagnostic.
+    factory = "pub fn factory() { let f: fn() = good; let _future = async move { f(); }; }"
+    low = run(factory, "max-instances = 4\n")
+    assert exhausted(low, "max-instances"), notes(low)
+    assert any("observed/attempted count 5" in note for note in notes(low))
+    complete(run(factory, "max-instances = 100\n"))
+
     # Unsupported coverage stays visible with all budgets unlimited.
     opaque = 'unsafe extern "Rust" {\n' + "".join(f"fn opaque{i}();\n" for i in range(7)) + "}\n"
     calls = "".join(f"unsafe {{ opaque{i}(); }}\n" for i in range(7))
@@ -190,7 +199,18 @@ def check():
     both = opaque.replace(f"{calls} bad();", f"{calls} let f: {nested_type} = {nested_value}; f{'.0' * 12}();")
     low = run(both, "max-aggregate-depth = 2\nmax-incomplete-notes = 1\n")
     assert exhausted(low, "max-aggregate-depth"), notes(low)
-    assert len([n for n in notes(low) if n.startswith(("MIR unavailable", "unresolved function pointer"))]) == 1, notes(low)
+    assert not any(n.startswith(("MIR unavailable", "unresolved function pointer")) for n in notes(low)), notes(low)
+    assert any("8 additional incomplete reasons omitted" in n for n in notes(low)), notes(low)
+    # Repeated failures of one budget are capped, while separate exhausted
+    # budgets each retain a visible note even when the cap is only one.
+    low = run(direct, "max-instances = 1\nmax-incomplete-notes = 1\n")
+    assert len([n for n in notes(low) if n.startswith("max-instances=")]) == 1
+    high = run(direct, 'max-instances = 1\nmax-incomplete-notes = "unlimited"\n')
+    occurrences = len([n for n in notes(high) if n.startswith("max-instances=")])
+    assert occurrences > 1
+    assert any(f"{occurrences - 1} additional incomplete reasons omitted" in n for n in notes(low)), notes(low)
+    low = run(deep, "max-aggregate-depth = 2\nmax-dataflow-iterations = 1\nmax-incomplete-notes = 1\n")
+    assert exhausted(low, "max-aggregate-depth") and exhausted(low, "max-dataflow-iterations"), notes(low)
 
     for source, settings in [(direct, "max-instances = 1\n"), (opaque, unlimited)]:
         result = run(source, settings, "-Dasync_hygiene_incomplete", success=False)
