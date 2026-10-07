@@ -1,0 +1,2 @@
+- Commit progress as you go.
+- Always bypass GPG signing when committing. Include a co-author tag for the model used.
