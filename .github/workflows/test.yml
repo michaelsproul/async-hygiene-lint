@@ -1,0 +1,21 @@
+name: Test
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Install Dylint
+        run: cargo +stable install --locked cargo-dylint dylint-link --version 6.1.0
+      - name: Format and unit tests
+        run: |
+          cargo fmt --check
+          cargo test --locked
+      - name: Dylint integration tests
+        run: |
+          python3 tests/check.py
+          python3 tests/check.py tokio
+          python3 tests/check.py limits
+          python3 tests/controls.py

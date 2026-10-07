@@ -16,7 +16,7 @@ use rustc_middle::{
     ty::{self, EarlyBinder, Instance, InstanceKind, Ty, TyCtxt, TypeVisitableExt, TypingEnv},
 };
 use rustc_span::Span;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Callable provenance is field-sensitive. References retain the pointee's
 /// abstract value; array indices conservatively join all possible elements.
@@ -25,6 +25,7 @@ struct Value<'tcx> {
     targets: Vec<Instance<'tcx>>,
     fields: BTreeMap<usize, Value<'tcx>>,
     truncated: bool,
+    unknown: bool,
 }
 
 impl<'tcx> Value<'tcx> {
@@ -45,6 +46,10 @@ impl<'tcx> Value<'tcx> {
 
     fn join_at_depth(&mut self, other: &Self, depth: usize) -> bool {
         let mut changed = false;
+        if other.unknown && !self.unknown {
+            self.unknown = true;
+            changed = true;
+        }
         for target in &other.targets {
             if !self.targets.contains(target) {
                 self.targets.push(*target);
@@ -111,6 +116,21 @@ fn place_value<'tcx>(locals: &[Value<'tcx>], place: &Place<'tcx>) -> Value<'tcx>
     locals[place.local.as_usize()].projected(place.projection)
 }
 
+/// Count unique type components, skipping shared subtrees. Expanding `(T, T)`
+/// recursively must not make the work-limit check itself exponential.
+fn type_size(instance: Instance<'_>) -> usize {
+    let mut seen = HashSet::new();
+    for generic in instance.args {
+        let mut walk = generic.walk();
+        while let Some(arg) = walk.next() {
+            if !seen.insert(arg) {
+                walk.skip_current_subtree();
+            }
+        }
+    }
+    seen.len()
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct Edge {
     target: usize,
@@ -123,8 +143,10 @@ struct Node<'tcx> {
     inputs: Vec<Value<'tcx>>,
     output: Value<'tcx>,
     edges: Vec<Edge>,
+    discovered: Vec<usize>,
     prohibited: Option<usize>,
     incomplete: Vec<String>,
+    ancestry: Vec<Instance<'tcx>>,
 }
 
 struct Analysis<'a, 'tcx> {
@@ -137,6 +159,7 @@ struct Analysis<'a, 'tcx> {
     indices: HashMap<(Instance<'tcx>, Vec<Value<'tcx>>, TypingEnv<'tcx>), usize>,
     changed: bool,
     limited: bool,
+    current: Option<usize>,
 }
 
 pub fn check<'tcx>(cx: &LateContext<'tcx>, config: &Config) {
@@ -164,8 +187,10 @@ pub fn check<'tcx>(cx: &LateContext<'tcx>, config: &Config) {
         indices: HashMap::new(),
         changed: false,
         limited: false,
+        current: None,
     };
     let mut async_owners = Vec::new();
+    let mut seeds = Vec::new();
     for owner in tcx.hir_body_owners() {
         let is_async = tcx.coroutine_is_async(owner.to_def_id())
             || (matches!(tcx.def_kind(owner), DefKind::AssocFn)
@@ -187,15 +212,27 @@ pub fn check<'tcx>(cx: &LateContext<'tcx>, config: &Config) {
             owner.to_def_id(),
             ty::GenericArgs::identity_for_item(tcx, owner),
         );
-        analysis.node(instance, Vec::new());
+        if let Some(id) = analysis.node(instance, Vec::new()) {
+            seeds.push(id);
+        }
     }
     analysis.solve();
-    for owner in async_owners {
+    // Discard provisional construction contexts from earlier fixed-point
+    // rounds, such as a future created before its factory's return is known.
+    let mut live = vec![false; analysis.nodes.len()];
+    while let Some(id) = seeds.pop() {
+        if std::mem::replace(&mut live[id], true) {
+            continue;
+        }
+        seeds.extend(analysis.nodes[id].edges.iter().map(|edge| edge.target));
+        seeds.extend(analysis.nodes[id].discovered.iter().copied());
+    }
+    for &owner in &async_owners {
         let mut roots: Vec<_> = analysis
             .nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| node.instance.def_id() == owner.to_def_id())
+            .filter(|(id, node)| live[*id] && node.instance.def_id() == owner.to_def_id())
             .map(|(id, _)| id)
             .collect();
         // Prefer actual construction contexts over the open-world seed. The
@@ -206,7 +243,7 @@ pub fn check<'tcx>(cx: &LateContext<'tcx>, config: &Config) {
         {
             roots.retain(|&id| !analysis.nodes[id].inputs.is_empty());
         }
-        analysis.report(owner, &roots);
+        analysis.report(owner, &roots, &async_owners);
     }
 }
 
@@ -228,6 +265,29 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             self.limited = true;
             return None;
         }
+        let mut ancestry = self
+            .current
+            .map_or_else(Vec::new, |id| self.nodes[id].ancestry.clone());
+        // Polymorphic recursion can create infinitely many distinct instances
+        // (and exponentially growing types), even in uncalled Rust functions.
+        // Ordinary recursion reuses an existing key above and is unaffected.
+        let recursive: Vec<_> = ancestry
+            .iter()
+            .filter(|ancestor| ancestor.def_id() == instance.def_id())
+            .collect();
+        if matches!(instance.def, InstanceKind::Item(_))
+            && recursive.len() >= 8
+            && type_size(instance) >= type_size(**recursive.last().unwrap())
+        {
+            if let Some(caller) = self.current {
+                self.incomplete(caller, format!(
+                    "recursive instance expansion limit reached at `{}` (eight instances per function unless types shrink)",
+                    self.path(instance.def_id())
+                ));
+            }
+            return None;
+        }
+        ancestry.push(instance);
         let path = self.path(instance.def_id());
         let prohibited = self
             .config
@@ -247,11 +307,21 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             inputs,
             output: Value::default(),
             edges: Vec::new(),
+            discovered: Vec::new(),
             prohibited,
             incomplete: Vec::new(),
+            ancestry,
         });
         self.changed = true;
         Some(id)
+    }
+
+    fn discover(&mut self, caller: usize, instance: Instance<'tcx>, inputs: Vec<Value<'tcx>>) {
+        if let Some(id) = self.node(instance, inputs) {
+            if !self.nodes[caller].discovered.contains(&id) {
+                self.nodes[caller].discovered.push(id);
+            }
+        }
     }
 
     fn solve(&mut self) {
@@ -303,11 +373,16 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         }
         match operand {
             Operand::Copy(place) | Operand::Move(place) => place_value(locals, place),
+            Operand::Constant(_) if matches!(ty.kind(), ty::FnPtr(..)) => Value {
+                unknown: true,
+                ..Value::default()
+            },
             Operand::Constant(_) | Operand::RuntimeChecks(_) => Value::default(),
         }
     }
 
     fn scan(&mut self, id: usize) {
+        self.current = Some(id);
         if self.nodes[id].prohibited.is_some() {
             return;
         }
@@ -323,12 +398,19 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 return;
             }
             InstanceKind::Item(def_id) if !self.tcx.is_mir_available(def_id) => {
+                let cause = if matches!(
+                    self.tcx.crate_name(def_id.krate).as_str(),
+                    "std" | "core" | "alloc"
+                ) {
+                    "precompiled standard library"
+                } else if self.tcx.is_foreign_item(def_id) {
+                    "external/FFI implementation"
+                } else {
+                    "compile dependencies with -Zalways-encode-mir"
+                };
                 self.incomplete(
                     id,
-                    format!(
-                        "MIR unavailable for `{}` (compile dependencies with -Zalways-encode-mir)",
-                        self.path(def_id)
-                    ),
+                    format!("MIR unavailable for `{}` ({cause})", self.path(def_id)),
                 );
                 return;
             }
@@ -336,9 +418,19 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         }
         let body = self.tcx.instance_mir(instance.def);
         let previous_edges = self.nodes[id].edges.clone();
+        let previous_discovered = self.nodes[id].discovered.clone();
         let mut locals = vec![Value::default(); body.local_decls.len()];
         for (local, input) in locals.iter_mut().skip(1).zip(&self.nodes[id].inputs) {
             local.join(input);
+        }
+        for argument in (self.nodes[id].inputs.len() + 1)..=body.arg_count {
+            let ty = self.instantiate_ty(
+                instance,
+                body.local_decls[rustc_middle::mir::Local::from_usize(argument)].ty,
+            );
+            if matches!(ty.peel_refs().kind(), ty::FnPtr(..)) {
+                locals[argument].unknown = true;
+            }
         }
         // Monotone, flow-insensitive may analysis within a body. Reassignment
         // retains both alternatives; loops and joins converge without recursion.
@@ -347,6 +439,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             // callee's return summary propagates. Report only the final round.
             self.nodes[id].incomplete.clear();
             self.nodes[id].edges.clear();
+            self.nodes[id].discovered.clear();
             let mut changed = false;
             for block in body.basic_blocks.iter() {
                 for statement in &block.statements {
@@ -354,7 +447,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                         let (place, rvalue) = &**assignment;
                         let mut value = Value::default();
                         match rvalue {
-                            Rvalue::Use(op, _) => {
+                            Rvalue::Use(op, _) | Rvalue::WrapUnsafeBinder(op, _) => {
                                 value = self.operand(body, instance, &locals, op);
                             }
                             Rvalue::Cast(_, op, _) => {
@@ -365,8 +458,16 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                                     value.targets.push(Instance::new_raw(def_id, args));
                                 }
                             }
-                            Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                            Rvalue::Ref(_, _, place)
+                            | Rvalue::RawPtr(_, place)
+                            | Rvalue::CopyForDeref(place)
+                            | Rvalue::Reborrow(_, _, place) => {
                                 value = place_value(&locals, place);
+                            }
+                            Rvalue::Repeat(op, _) => {
+                                value
+                                    .fields
+                                    .insert(0, self.operand(body, instance, &locals, op));
                             }
                             Rvalue::Aggregate(kind, operands) => {
                                 for (index, op) in operands.iter().enumerate() {
@@ -385,7 +486,8 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                                             // Lowered Future::poll receives Pin<&mut Self>.
                                             let mut pinned = Value::default();
                                             pinned.fields.insert(0, value.clone());
-                                            self.node(
+                                            self.discover(
+                                                id,
                                                 Instance::new_raw(def_id, args),
                                                 vec![pinned, Value::default()],
                                             );
@@ -417,7 +519,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                             .collect();
                         let targets = self.operand(body, instance, &locals, func);
                         let mut returned = Value::default();
-                        if targets.targets.is_empty() {
+                        if targets.targets.is_empty() || targets.unknown {
                             self.incomplete(id, "unresolved function pointer call".into());
                         }
                         for target in targets.targets {
@@ -447,6 +549,11 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                                 vec![place_value(&locals, place)],
                                 terminator.source_info.span,
                             );
+                        } else if ty.has_non_region_param() && ty.needs_drop(self.tcx, self.env) {
+                            self.incomplete(
+                                id,
+                                format!("unresolved generic destructor for `{ty}`"),
+                            );
                         }
                     }
                     _ => {}
@@ -467,6 +574,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         }
         self.changed |= self.nodes[id].output.join(&locals[0]);
         self.changed |= previous_edges != self.nodes[id].edges;
+        self.changed |= previous_discovered != self.nodes[id].discovered;
     }
 
     fn call(
@@ -504,25 +612,29 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         {
             let insulated = rule.callback_args.clone();
             if insulated.iter().any(|&index| index >= values.len()) {
-                self.incomplete(
-                    caller,
+                self.tcx.dcx().span_err(
+                    span,
                     format!("insulator `{path}` has an out-of-range callback argument"),
                 );
+                return Value::default();
             }
             for (index, value) in values.iter().enumerate() {
-                if insulated.contains(&index) {
-                    continue;
-                }
                 for &callback in &value.targets {
-                    self.edge(caller, callback, Vec::new(), span);
+                    if insulated.contains(&index) {
+                        // Discover async blocks constructed on the blocking
+                        // thread without propagating its synchronous effects.
+                        self.discover(caller, callback, Vec::new());
+                    } else {
+                        self.edge(caller, callback, Vec::new(), span);
+                    }
                 }
                 if let ty::Closure(def_id, args) = *types[index].peel_refs().kind() {
-                    self.edge(
-                        caller,
-                        Instance::new_raw(def_id, args),
-                        vec![value.clone()],
-                        span,
-                    );
+                    let callback = Instance::new_raw(def_id, args);
+                    if insulated.contains(&index) {
+                        self.discover(caller, callback, vec![value.clone()]);
+                    } else {
+                        self.edge(caller, callback, vec![value.clone()], span);
+                    }
                 }
             }
             return Value::default();
@@ -556,7 +668,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         self.nodes[id].output.clone()
     }
 
-    fn report(&self, owner: LocalDefId, roots: &[usize]) {
+    fn report(&self, owner: LocalDefId, roots: &[usize], async_owners: &[LocalDefId]) {
         let hir_id = self.tcx.local_def_id_to_hir_id(owner);
         let root_span = self.tcx.def_span(owner);
         let mut previous = vec![None; self.nodes.len()];
@@ -569,6 +681,15 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         let mut incomplete = Vec::new();
         while let Some(id) = queue.pop_front() {
             let node = &self.nodes[id];
+            if let Some(local) = node.instance.def_id().as_local()
+                && local != owner
+                && async_owners.contains(&local)
+                && node.prohibited.is_none()
+            {
+                // A separately checked async body owns its own diagnostics.
+                // External async bodies are still traversed from local roots.
+                continue;
+            }
             if let Some(rule_index) = node.prohibited {
                 if !reported[rule_index] {
                     reported[rule_index] = true;

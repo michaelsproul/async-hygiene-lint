@@ -1,0 +1,23 @@
+# Copy this file to the root of the workspace you want to lint as dylint.toml.
+# Each supplied array replaces that default array in its entirety.
+[async_hygiene]
+max-instances = 10000
+max-iterations = 100
+
+prohibited = [
+    { path = "tokio::runtime::Handle::block_on", reason = "nested runtimes panic" },
+    { path = "tokio::runtime::Runtime::block_on", reason = "nested runtimes panic" },
+    { path = "futures_executor::block_on", reason = "blocks the executor thread" },
+    { path = "std::thread::sleep", reason = "use an async timer" },
+    { path = "std::thread::park", reason = "blocks the executor thread" },
+    # { path = "my_crate::blocking_io", reason = "use the blocking pool" },
+]
+
+insulators = [
+    { path = "tokio::task::spawn_blocking", callback-args = [0] },
+    { path = "tokio::task::block_in_place", callback-args = [0] },
+    # Method receivers count as argument zero.
+    { path = "tokio::runtime::Handle::spawn_blocking", callback-args = [1] },
+    { path = "tokio::runtime::Runtime::spawn_blocking", callback-args = [1] },
+    { path = "std::thread::spawn", callback-args = [0] },
+]

@@ -10,7 +10,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 name = sys.argv[1] if len(sys.argv) > 1 else "program"
 FIXTURE = ROOT / "tests/fixtures" / name
-package = {"program": "hygiene_fixture", "tokio": "tokio_fixture"}[name]
+package = {"program": "hygiene_fixture", "tokio": "tokio_fixture", "limits": "limits_fixture"}[name]
 subprocess.run(["cargo", "build", "--locked"], cwd=ROOT, check=True)
 libraries = list((ROOT / "target/debug").glob("*async_hygiene@*"))
 assert len(libraries) == 1, libraries
@@ -19,7 +19,9 @@ env = dict(os.environ, RUSTFLAGS="-Zalways-encode-mir -Zmir-opt-level=0")
 env["CARGO_TARGET_DIR"] = str(ROOT / "target/fixtures")
 env["DYLINT_DRIVER_PATH"] = str(ROOT / "target/dylint-drivers")
 Path(env["DYLINT_DRIVER_PATH"]).mkdir(parents=True, exist_ok=True)
-subprocess.run(["cargo", "clean", "-p", package], cwd=FIXTURE, env=env, check=True)
+toolchain = libraries[0].name.split("@", 1)[1].rsplit(".", 1)[0]
+effective_target = Path(env["CARGO_TARGET_DIR"]) / "dylint/target" / toolchain
+subprocess.run(["cargo", "clean", "--target-dir", str(effective_target), "-p", package], cwd=FIXTURE, env=env, check=True)
 result = subprocess.run([
     "cargo", "dylint", "--lib-path", str(libraries[0]), "--", "--message-format=json"
 ], cwd=FIXTURE, env=env, text=True, capture_output=True)
@@ -47,6 +49,7 @@ actual = collections.Counter()
 actual_incomplete = collections.Counter()
 for message in diagnostics:
     code = (message.get("code") or {}).get("code")
+    assert code != "unfulfilled_lint_expectations", message
     if code in ("disallowed_from_async", "async_hygiene_incomplete"):
         primary = [s for s in message["spans"] if s["is_primary"]]
         assert len(primary) == 1, primary

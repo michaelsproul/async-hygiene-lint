@@ -3,7 +3,10 @@ prohibited = [
     { path = "hygiene_fixture::bad", reason = "test blocking operation" },
     { path = "hygiene_fixture::other_bad" },
     { path = "blocking::bad" },
+    { path = "std::vec::Vec::new" },
 ]
 insulators = [
     { path = "hygiene_fixture::offload", callback-args = [0] },
+    { path = "hygiene_fixture::split_execution", callback-args = [0] },
+    { path = "hygiene_fixture::Worker::offload", callback-args = [1] },
 ]

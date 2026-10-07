@@ -57,3 +57,22 @@ pub async fn explicitly_allowed() { bad(); }
 
 pub async fn unknown_pointer(f: fn()) { f(); } //~ incomplete
 pub async fn dynamic_dispatch(x: &dyn Work) { x.work(); } //~ incomplete
+
+pub async fn vector_direct() -> Vec<u64> { Vec::new() } //~ prohibited
+pub async fn vector_callback() -> Vec<u64> { std::iter::repeat(()).take(5).flat_map(|()| Vec::<u64>::new()).collect() } //~ prohibited //~ incomplete
+pub async fn async_closure() { let f = async || { bad(); }; f().await; } //~ prohibited
+pub async fn nested_async() { offload(|| { let _f = async { bad(); }; }); } //~ prohibited
+pub async fn nested_captured() { let f: fn() = bad; offload(move || { let _f = async move { f(); }; }); } //~ prohibited
+pub async fn repeated_pointer() { let functions = [bad as fn(); 3]; functions[1](); } //~ prohibited
+pub async fn partially_unknown(f: fn(), choose: bool) { let f = if choose { f } else { good }; f(); } //~ incomplete
+pub fn future_factory_capture() { let f = pointer(); let _future = async move { f(); }; } //~ prohibited
+
+fn split_execution<A: FnOnce(), B: FnOnce()>(a: A, b: B) { a(); b(); }
+pub async fn selected_argument_safe() { split_execution(|| bad(), || good()); }
+pub async fn other_argument_unsafe() { split_execution(|| good(), || bad()); } //~ prohibited
+impl Worker { fn offload<F: FnOnce()>(&self, f: F) { f(); } }
+fn receiver() -> Worker { bad(); Worker }
+pub async fn method_callback() { Worker.offload(|| bad()); }
+pub async fn eager_receiver() { receiver().offload(|| good()); } //~ prohibited
+#[expect(disallowed_from_async)]
+pub async fn expected_warning() { bad(); }
